@@ -1,0 +1,357 @@
+#include <Wire.h>
+#include <DHT.h>
+#include <RTClib.h>
+#include <LiquidCrystal_I2C.h>
+#include <avr/wdt.h>  // Watchdog
+
+// === CONFIGURACIÓN DE PINES ===
+const int relayExtractor = 2;
+const int relayIntractor = 3;
+const int relayCalefactor = 4;
+const int relayHumificador = 5;
+const int relayLampara1 = 7;
+const int relayLampara2 = 8;
+const int relayBocina = 6;
+
+const int pinMQ2 = A0;
+const int pinReset = 10; // Botón reset alarma
+
+// === CONFIGURACIÓN DEL SENSOR DHT ===
+#define DHTPIN 9
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// === RTC ===
+RTC_DS1307 rtc;
+
+// === LCD I2C ===
+LiquidCrystal_I2C lcd(0x3F, 16, 2);
+
+// === VARIABLES DE CONTROL ===
+float temperaturaMin = 18.0;
+float temperaturaApagarCalefactor = 21.0;
+float humedadMin = 40.0;
+float humedadOff = 45.0; // Histéresis apagado humidificador
+
+// Estado calefactor
+bool calefactorEncendido = false;
+unsigned long tiempoEncendidoCalefactor = 0;
+unsigned long tiempoApagadoCalefactor = 0;
+const unsigned long maximoTiempoEncendido = 45UL * 60UL * 1000UL; // 45 min
+const unsigned long tiempoMinimoApagado = 15UL * 60UL * 1000UL;   // 15 min
+
+// Estado extractores
+bool extractoresEncendidos = false;
+unsigned long ultimaVentilacion = 0;
+const unsigned long intervaloVentilacion = 60UL * 60UL * 1000UL; // 1h
+const unsigned long duracionVentilacion = 60UL * 1000UL;         // 1 min
+unsigned long finVentilacion = 0;
+
+// Estado humificador
+bool humificadorEncendido = false;
+
+// Estado lámparas
+const int horaInicioLuz = 19;   // 19:00 hs
+const int duracionLuzHoras = 18; // hasta las 13:00 hs
+unsigned long retardoLampara2 = 5000;
+unsigned long tiempoPrenderLampara2 = 0;
+bool lampara2Pendiente = false;
+bool lamparasEncendidas = false;
+
+// Estado alarma humo
+const int umbralHumo = 6000;
+bool alarmaHumo = false;
+unsigned long inicioBocina = 0;
+unsigned long tiempoAlarmaCiclo = 0;
+bool bocinaEncendida = false;
+const unsigned long duracionBocinaOn = 2000;
+const unsigned long duracionAlarmaMax = 5UL * 60UL * 1000UL; // 5 min
+const unsigned long pausaAlarma = 5UL * 60UL * 1000UL;       // 5 min
+bool cicloAlarmaActivo = false;
+
+// Variables lectura
+float temperatura;
+float humedad;
+int valorMQ2;
+
+// === VARIABLES LECTURA DHT CON BACKUP ===
+unsigned long ultimaLecturaDHT = 0;
+const unsigned long intervaloDHT = 2000; // 2 seg
+int fallosConsecutivosDHT = 0;
+const int maxFallosDHT = 10;
+float ultimaTempValida = 20.0;
+float ultimaHumedadValida = 50.0;
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+  Wire.begin();
+  rtc.begin();
+
+  // Ajustar hora UNA sola vez, luego comentar:
+  // rtc.adjust(DateTime(2025, 9, 26, 14, 3, 0));
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0); lcd.print("H:--%   T:--C");
+  lcd.setCursor(0, 1); lcd.print("--:--:-- MQ:---");
+
+  // Configurar pines
+  pinMode(relayExtractor, OUTPUT);
+  pinMode(relayIntractor, OUTPUT);
+  pinMode(relayCalefactor, OUTPUT);
+  pinMode(relayHumificador, OUTPUT);
+  pinMode(relayLampara1, OUTPUT);
+  pinMode(relayLampara2, OUTPUT);
+  pinMode(relayBocina, OUTPUT);
+  pinMode(pinReset, INPUT_PULLUP);
+
+  apagarTodosRelays();
+
+  ultimaVentilacion = millis();
+  tiempoApagadoCalefactor = millis();
+
+  // === WATCHDOG ===
+  wdt_enable(WDTO_8S); // reinicio si se cuelga más de 8 segundos
+}
+
+void loop() {
+  unsigned long ahoraMillis = millis();
+
+  // Reiniciamos el watchdog en cada ciclo
+  wdt_reset();
+
+  // ===== LECTURA DHT CADA 2 SEG =====
+  if (ahoraMillis - ultimaLecturaDHT >= intervaloDHT) {
+    ultimaLecturaDHT = ahoraMillis;
+
+    float tempLectura = dht.readTemperature();
+    float humLectura = dht.readHumidity();
+
+    if (isnan(tempLectura) || isnan(humLectura)) {
+      fallosConsecutivosDHT++;
+      Serial.print("Error DHT - Fallo ");
+      Serial.print(fallosConsecutivosDHT);
+      Serial.print(" de ");
+      Serial.println(maxFallosDHT);
+
+      // Reiniciar sensor después de 10 fallos
+      if (fallosConsecutivosDHT >= maxFallosDHT) {
+        Serial.println(">>> REINICIANDO DHT22 <<<");
+        dht.begin();
+        delay(100);
+        fallosConsecutivosDHT = 0;
+      }
+
+      // Usar valores previos válidos mientras se recupera
+      temperatura = ultimaTempValida;
+      humedad = ultimaHumedadValida;
+
+    } else {
+      // Validar rangos
+      if (tempLectura >= -10.0 && tempLectura <= 60.0 &&
+          humLectura >= 0.0 && humLectura <= 100.0) {
+
+        temperatura = tempLectura;
+        humedad = humLectura;
+        ultimaTempValida = tempLectura;
+        ultimaHumedadValida = humLectura;
+        fallosConsecutivosDHT = 0;
+      }
+    }
+  }
+
+  // Lectura MQ2
+  valorMQ2 = analogRead(pinMQ2);
+
+  // Lectura RTC
+  DateTime now = rtc.now();
+
+  // RESET MANUAL DE ALARMA
+  if (digitalRead(pinReset) == LOW) {
+    alarmaHumo = false;
+    cicloAlarmaActivo = false;
+    apagarTodosRelays();
+  }
+
+  // ACTUALIZAR LCD
+  lcd.setCursor(0, 0);
+  lcd.print("H:");
+  if (isnan(humedad)) lcd.print("--");
+  else lcd.print(humedad, 0);
+  lcd.print("% ");
+
+  lcd.print("T:");
+  if (isnan(temperatura)) lcd.print("--");
+  else lcd.print(temperatura, 0);
+  lcd.print("C ");
+
+  lcd.setCursor(0, 1);
+  if (now.isValid()) {
+    char buffer[9];
+    sprintf(buffer, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+    lcd.print(buffer);
+  } else {
+    lcd.print("No RTC  ");
+  }
+  lcd.print(" MQ:"); lcd.print(valorMQ2);
+
+  // SENSOR FALLA: apagar calefactor y humificador
+  if (isnan(temperatura) || isnan(humedad)) {
+    if (calefactorEncendido) {
+      calefactorEncendido = false;
+      digitalWrite(relayCalefactor, HIGH);
+    }
+    if (humificadorEncendido) {
+      humificadorEncendido = false;
+      digitalWrite(relayHumificador, HIGH);
+    }
+  }
+
+  // ALARMA HUMO
+  if (!alarmaHumo && valorMQ2 >= umbralHumo) {
+    alarmaHumo = true;
+    cicloAlarmaActivo = true;
+    inicioBocina = ahoraMillis;
+    tiempoAlarmaCiclo = ahoraMillis;
+    apagarTodosRelays();
+  }
+  if (alarmaHumo) {
+    manejarAlarma(ahoraMillis);
+    return;
+  }
+
+  // CONTROL EXTRACTORES
+  if (!extractoresEncendidos && !isnan(temperatura) && temperatura >= 25.0) {
+    extractoresEncendidos = true;
+    digitalWrite(relayExtractor, LOW);
+    digitalWrite(relayIntractor, LOW);
+  } else if (extractoresEncendidos && !isnan(temperatura) && temperatura <= 20.0) {
+    extractoresEncendidos = false;
+    digitalWrite(relayExtractor, HIGH);
+    digitalWrite(relayIntractor, HIGH);
+  }
+
+  // Ventilación forzada cada hora
+  if (ahoraMillis - ultimaVentilacion >= intervaloVentilacion) {
+    ultimaVentilacion = ahoraMillis;
+    finVentilacion = ahoraMillis + duracionVentilacion;
+    digitalWrite(relayExtractor, LOW);
+    digitalWrite(relayIntractor, LOW);
+  }
+  if (finVentilacion > 0 && ahoraMillis >= finVentilacion) {
+    finVentilacion = 0;
+    digitalWrite(relayExtractor, HIGH);
+    digitalWrite(relayIntractor, HIGH);
+  }
+
+  // CALEFACTOR POR TEMPERATURA + TIEMPO
+  if (!isnan(temperatura)) {
+    if (!calefactorEncendido && temperatura <= temperaturaMin) {
+      if (ahoraMillis - tiempoApagadoCalefactor >= tiempoMinimoApagado) {
+        calefactorEncendido = true;
+        tiempoEncendidoCalefactor = ahoraMillis;
+        digitalWrite(relayCalefactor, LOW);
+      }
+    } else if (calefactorEncendido) {
+      if (temperatura >= temperaturaApagarCalefactor ||
+          (ahoraMillis - tiempoEncendidoCalefactor >= maximoTiempoEncendido)) {
+        calefactorEncendido = false;
+        tiempoApagadoCalefactor = ahoraMillis;
+        digitalWrite(relayCalefactor, HIGH);
+      }
+    }
+  }
+
+  // HUMIDIFICADOR
+  if (!isnan(humedad)) {
+    if (!humificadorEncendido && humedad < humedadMin) {
+      humificadorEncendido = true;
+      digitalWrite(relayHumificador, LOW);
+    } else if (humificadorEncendido && humedad >= humedadOff) {
+      humificadorEncendido = false;
+      digitalWrite(relayHumificador, HIGH);
+    }
+  }
+
+  // LÁMPARAS (RTC)
+  controlarLamparasRTC(now, ahoraMillis);
+}
+
+// === FUNCIONES AUXILIARES ===
+
+void controlarLamparasRTC(DateTime ahora, unsigned long ahoraMillis) {
+  int horaActual = ahora.hour();
+  int horaFin = (horaInicioLuz + duracionLuzHoras) % 24;
+
+  if (horaInicioLuz < horaFin) {
+    if (horaActual >= horaInicioLuz && horaActual < horaFin) {
+      prenderLamparas(ahoraMillis);
+    } else {
+      apagarLamparas();
+    }
+  } else {
+    if (horaActual >= horaInicioLuz || horaActual < horaFin) {
+      prenderLamparas(ahoraMillis);
+    } else {
+      apagarLamparas();
+    }
+  }
+
+  if (lampara2Pendiente && ahoraMillis >= tiempoPrenderLampara2) {
+    digitalWrite(relayLampara2, LOW);
+    lampara2Pendiente = false;
+  }
+}
+
+void prenderLamparas(unsigned long ahoraMillis) {
+  digitalWrite(relayLampara1, LOW);
+  if (!lamparasEncendidas) {
+    tiempoPrenderLampara2 = ahoraMillis + retardoLampara2;
+    lampara2Pendiente = true;
+    lamparasEncendidas = true;
+  }
+}
+
+void apagarLamparas() {
+  if (lamparasEncendidas || lampara2Pendiente) {
+    digitalWrite(relayLampara1, HIGH);
+    digitalWrite(relayLampara2, HIGH);
+    lampara2_cleanup();  // ✅ typo corregido
+  }
+}
+
+void lampara2_cleanup() {  // ✅ nombre corregido
+  lampara2Pendiente = false;
+  lamparasEncendidas = false;
+}
+
+void manejarAlarma(unsigned long ahora) {
+  if (cicloAlarmaActivo) {
+    if (ahora - tiempoAlarmaCiclo <= duracionAlarmaMax) {
+      if (!bocinaEncendida && ahora - inicioBocina >= duracionBocinaOn) {
+        bocinaEncendida = true;
+        inicioBocina = ahora;
+        digitalWrite(relayBocina, LOW);
+      } else if (bocinaEncendida && ahora - inicioBocina >= duracionBocinaOn) {
+        bocinaEncendida = false;
+        inicioBocina = ahora;
+        digitalWrite(relayBocina, HIGH);
+      }
+    } else if (ahora - tiempoAlarmaCiclo <= duracionAlarmaMax + pausaAlarma) {
+      digitalWrite(relayBocina, HIGH);
+    } else {
+      tiempoAlarmaCiclo = ahora;
+    }
+  }
+}
+
+void apagarTodosRelays() {
+  digitalWrite(relayExtractor, HIGH);
+  digitalWrite(relayIntractor, HIGH);
+  digitalWrite(relayCalefactor, HIGH);
+  digitalWrite(relayHumificador, HIGH);
+  digitalWrite(relayLampara1, HIGH);
+  digitalWrite(relayLampara2, HIGH);
+  digitalWrite(relayBocina, HIGH);
+} 
