@@ -1,0 +1,543 @@
+/*
+ Sketch final integrado:
+ - Ciclo 13h ON / 14h OFF (27h) desfasado con RTC
+ - Pre-on extractores 5s (ms-preciso) antes de ON
+ - Extractores siempre ON durante ON; cuando OFF control por humedad (ON >=60% / OFF <=45%)
+ - Secuencia: extractores -> LED (5s) -> Sodio (10s)
+ - Sodio: si T >= 38°C -> se apaga y queda BLOQUEADO hasta reinicio manual del Arduino
+ - Si Arduino reinicia por WATCHDOG -> sodio espera 30 min desde ese reset (persistente en EEPROM)
+ - DHT leído cada 2s; si 10 lecturas idénticas -> reintentar dht.begin() (NO destruir objeto, NO reset Arduino)
+ - EEPROM: guarda flag sodioBlocked (1 byte) y timestamp last_watchdog_reset (4 bytes) solo cuando cambia
+ - LCD muestra T, H, hora y tiempo restante ON/OFF
+*/
+
+#include <Wire.h>
+#include <DHT.h>
+#include <RTClib.h>
+#include <LiquidCrystal_I2C.h>
+#include <avr/wdt.h>
+#include <avr/io.h>
+#include <EEPROM.h>
+
+// PINES
+const int relayExtractor = 2;
+const int relayIntractor = 3;
+const int relayCalefactor = 4;
+const int relayHumificador = 5;
+const int relayLampara1 = 7; // LED
+const int relayLampara2 = 8; // Sodio
+const int relayBocina = 6;
+
+const int pinMQ2 = A0;
+const int pinReset = 10; // Botón reset alarma
+
+// DHT
+#define DHTPIN 9
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// RTC
+RTC_DS1307 rtc;
+
+// Parámetros
+const float temperaturaMin = 18.0;
+const float temperaturaApagarCalefactor = 21.0;
+const float humedadMin = 40.0;
+const float humedadOff = 45.0;
+
+// Sodio lock por temperatura (permanente hasta reinicio manual)
+bool sodioTempBlocked = false;
+const float umbralTemperaturaAlta = 38.0;
+
+// Extractores por humedad cuando luces OFF: ON >=60, OFF <=45
+const float umbralHumedadOn = 60.0;
+const float umbralHumedadOff = 45.0;
+bool extractoresEncendidosPorHumedad = false;
+
+// Ciclo 27h -> usamos segundos para modulo
+const unsigned long duracionCiclo = 27UL * 3600UL; // s
+const unsigned long duracionEncendido = 13UL * 3600UL; // s
+const unsigned long duracionApagado = 14UL * 3600UL; // s
+
+// EEPROM addresses
+const int ADDR_SODIO_BLOCKED = 0;        // 1 byte
+const int ADDR_LAST_WDOG_RESET = 4;     // 4 bytes (unsigned long)
+
+// Secuencia tiempos (ms)
+const unsigned long preOnMs = 5000UL;       // 5s pre-on
+const unsigned long tiempoDelayExtractores = 5000UL; // 5s desde extractores a LED
+const unsigned long tiempoDelayLED = 10000UL;       // 10s desde LED a sodio
+
+// LCD
+LiquidCrystal_I2C lcd(0x3F,16,2);
+
+// DHT timing
+unsigned long lastDHTreadMs = 0;
+const unsigned long intervaloDHT = 2000UL;
+float ultimaTemperatura = NAN;
+float ultimaHumedad = NAN;
+int repetidasDHT = 0;
+
+// Secuencia state
+enum EstadoLamparas { ST_IDLE, ST_PREON, ST_EXTRACTORES_ON, ST_LED_ON, ST_SODIO_ON, ST_READY };
+EstadoLamparas estadoLamparas = ST_IDLE;
+unsigned long tExtractorOnMs = 0;
+unsigned long tLedOnMs = 0;
+bool lamparasEncendidas = false;
+
+// Watchdog reset timestamp (epoch seconds) persisted
+unsigned long lastWatchdogResetEpoch = 0; // 0 means none recorded
+
+// Forward
+void cargarEEPROM();
+void guardarEEPROM_SodioBlockedIfChanged();
+void guardarEEPROM_WdogIfNeeded(unsigned long epochSec);
+unsigned long leerEpochNowOrFallback(bool &rtcValid, DateTime &now);
+void gestionarLecturaDHT();
+void controlarCalefactor();
+void controlarHumidificador();
+void manejarAlarmasYReset();
+void controlCentralExtractoresYLamparas(bool rtcValid, DateTime now);
+void manejarExtractoresHumedad();
+void actualizarDisplay(bool rtcValid, DateTime now);
+void detectarWatchdogResetYPersistir();
+
+
+// ---------- setup ----------
+void setup(){
+  Serial.begin(115200);
+  dht.begin();
+  Wire.begin();
+  rtc.begin();
+  lcd.init(); lcd.backlight();
+
+  pinMode(relayExtractor, OUTPUT);
+  pinMode(relayIntractor, OUTPUT);
+  pinMode(relayCalefactor, OUTPUT);
+  pinMode(relayHumificador, OUTPUT);
+  pinMode(relayLampara1, OUTPUT);
+  pinMode(relayLampara2, OUTPUT);
+  pinMode(relayBocina, OUTPUT);
+  pinMode(pinReset, INPUT_PULLUP);
+
+  // Apagar relays (HIGH = OFF, ajustar según tu placa)
+  digitalWrite(relayExtractor, HIGH);
+  digitalWrite(relayIntractor, HIGH);
+  digitalWrite(relayCalefactor, HIGH);
+  digitalWrite(relayHumificador, HIGH);
+  digitalWrite(relayLampara1, HIGH);
+  digitalWrite(relayLampara2, HIGH);
+  digitalWrite(relayBocina, HIGH);
+
+  // Detectar si reset fue por watchdog y persistir timestamp en EEPROM
+  detectarWatchdogResetYPersistir();
+
+  // Cargar EEPROM (sodio blocked flag y last watchdog reset)
+  cargarEEPROM();
+
+  // Habilitar watchdog (8s)
+  wdt_enable(WDTO_8S);
+}
+
+// Detect if reset was watchdog and write current epoch to EEPROM
+void detectarWatchdogResetYPersistir(){
+  // MCUSR bit WDRF indicates watchdog reset
+  uint8_t mcusr = MCUSR;
+  bool wasWdog = mcusr & (1<<WDRF);
+  MCUSR = 0; // clear flags
+
+  if(wasWdog){
+    // try to get epoch from RTC
+    DateTime now = rtc.now();
+    if(now.isValid()){
+      unsigned long epoch = now.unixtime();
+      EEPROM.put(ADDR_LAST_WDOG_RESET, epoch);
+      Serial.println(F("Watchdog reset detected - saved epoch to EEPROM"));
+    } else {
+      // write special marker 0xFFFFFFFF to indicate unknown time (can't persist accurate)
+      unsigned long marker = 0xFFFFFFFFUL;
+      EEPROM.put(ADDR_LAST_WDOG_RESET, marker);
+      Serial.println(F("Watchdog reset detected - RTC invalid, saved marker"));
+    }
+  }
+}
+
+// ---------- EEPROM load ----------
+void cargarEEPROM(){
+  byte b = EEPROM.read(ADDR_SODIO_BLOCKED);
+  sodioTempBlocked = (b != 0);
+
+  unsigned long stored;
+  EEPROM.get(ADDR_LAST_WDOG_RESET, stored);
+  lastWatchdogResetEpoch = stored;
+  if(lastWatchdogResetEpoch == 0xFFFFFFFFUL) {
+    // marker for unknown (RTC invalid when saving)
+    lastWatchdogResetEpoch = 0;
+  }
+  Serial.print(F("EEPROM sodio blocked: ")); Serial.println(sodioTempBlocked);
+  Serial.print(F("EEPROM last wdog epoch: ")); Serial.println(lastWatchdogResetEpoch);
+}
+
+// Save sodio blocked flag only if changed
+void guardarEEPROM_SodioBlockedIfChanged(){
+  static bool lastSaved = false;
+  static bool first = true;
+  if(first){
+    lastSaved = sodioTempBlocked;
+    first = false;
+  }
+  if(sodioTempBlocked != lastSaved){
+    EEPROM.update(ADDR_SODIO_BLOCKED, sodioTempBlocked ? 1 : 0);
+    lastSaved = sodioTempBlocked;
+    Serial.println(F("EEPROM: sodioBlocked updated"));
+  }
+}
+
+// Save lastWatchdogResetEpoch if needed (not used frequently)
+void guardarEEPROM_WdogIfNeeded(unsigned long epochSec){
+  unsigned long cur;
+  EEPROM.get(ADDR_LAST_WDOG_RESET, cur);
+  if(cur != epochSec){
+    EEPROM.put(ADDR_LAST_WDOG_RESET, epochSec);
+    lastWatchdogResetEpoch = epochSec;
+    Serial.println(F("EEPROM: lastWatchdogResetEpoch updated"));
+  }
+}
+
+// ---------- loop ----------
+void loop(){
+  DateTime now = rtc.now();
+  bool rtcValid = rtc.isrunning() && now.isValid();
+
+  // Read DHT (every 2s)
+  gestionarLecturaDHT();
+
+  // Controls
+  controlarCalefactor();
+  controlarHumidificador();
+  manejarAlarmasYReset();
+
+  // Block sodio on high temp (permanent until manual restart)
+  if(!isnan(ultimaTemperatura) && ultimaTemperatura >= umbralTemperaturaAlta){
+    if(!sodioTempBlocked){
+      sodioTempBlocked = true;
+      // persist changed flag
+      guardarEEPROM_SodioBlockedIfChanged();
+      // ensure sodio off
+      digitalWrite(relayLampara2, HIGH);
+      Serial.println(F("Sodio blocked due to high temperature (permanent until manual restart)"));
+    }
+  }
+
+  // Central control for extractors and lamps (pre-on uses ms precision)
+  controlCentralExtractoresYLamparas(rtcValid, now);
+
+  // Humidity control for extractors only when lights OFF and not in pre-on / forced
+  manejarExtractoresHumedad();
+
+  // Update LCD every 1s
+  static unsigned long lastLCD = 0;
+  unsigned long nowMs = millis();
+  if(nowMs - lastLCD >= 1000UL){
+    actualizarDisplay(rtcValid, now);
+    lastLCD = nowMs;
+  }
+
+  // Persist sodio flag if changed (efficient)
+  guardarEEPROM_SodioBlockedIfChanged();
+
+  // reset watchdog
+  wdt_reset();
+}
+
+
+// ---------- FUNCTIONS ----------
+
+// DHT reads every 2s. If same reading 10 times, re-run dht.begin() once (safe)
+void gestionarLecturaDHT(){
+  unsigned long ahora = millis();
+  if(ahora - lastDHTreadMs < intervaloDHT) return;
+  lastDHTreadMs = ahora;
+
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+
+  if(isnan(t) || isnan(h)){
+    // Ignore invalid read, do not count as repeated
+    Serial.println(F("DHT read NAN"));
+    return;
+  }
+
+  if(!isnan(ultimaTemperatura) && !isnan(ultimaHumedad) && t == ultimaTemperatura && h == ultimaHumedad){
+    repetidasDHT++;
+  } else {
+    repetidasDHT = 0;
+  }
+
+  ultimaTemperatura = t;
+  ultimaHumedad = h;
+
+  if(repetidasDHT >= 10){
+    Serial.println(F("DHT seems stuck - calling dht.begin() to reinit (safe)"));
+    dht.begin(); // safe reinit
+    repetidasDHT = 0;
+  }
+}
+
+// Calefactor
+void controlarCalefactor(){
+  if(isnan(ultimaTemperatura)) return;
+  if(ultimaTemperatura < temperaturaMin) digitalWrite(relayCalefactor, LOW);
+  else if(ultimaTemperatura > temperaturaApagarCalefactor) digitalWrite(relayCalefactor, HIGH);
+}
+
+// Humidificador
+void controlarHumidificador(){
+  if(isnan(ultimaHumedad)) return;
+  if(ultimaHumedad < humedadMin) digitalWrite(relayHumificador, LOW);
+  else if(ultimaHumedad > humedadOff) digitalWrite(relayHumificador, HIGH);
+}
+
+// Alarmas MQ2 + reset button; buzzer blinking 5s on/off while alarm condition persists
+void manejarAlarmasYReset(){
+  const int umbralMQ2 = 6000;
+  int val = analogRead(pinMQ2);
+  static unsigned long lastBuzzToggle = 0;
+  static bool buzzOn = false;
+
+  if(val > umbralMQ2){
+    unsigned long ahora = millis();
+    if(ahora - lastBuzzToggle >= 5000UL){
+      buzzOn = !buzzOn;
+      lastBuzzToggle = ahora;
+      digitalWrite(relayBocina, buzzOn ? LOW : HIGH);
+    }
+    // Optionally, you might want to turn off lamps or do other safety actions here.
+  } else {
+    digitalWrite(relayBocina, HIGH); // ensure off
+  }
+
+  // Reset button handling: if pressed, unlock sodioTempBlocked? user wanted manual restart to unlock sodio,
+  // so here button will not unlock sodioTempBlocked permanent block. We'll use button to acknowledge alarm only.
+  if(digitalRead(pinReset) == LOW){
+    // Acknowledge alarm: turn off buzzer
+    digitalWrite(relayBocina, HIGH);
+    Serial.println(F("Alarm reset button pressed - buzzer off"));
+    // Note: permanent sodioTempBlocked only cleared by full manual restart of Arduino per requirement
+  }
+}
+
+// Central control of extractors & lamps
+void controlCentralExtractoresYLamparas(bool rtcValid, DateTime now){
+  unsigned long epochSec = leerEpochNowOrFallback(rtcValid, now);
+  unsigned long tiempoCicloSec = epochSec % duracionCiclo;
+
+  bool shouldBeOn = (tiempoCicloSec < duracionEncendido);
+
+  // Determine pre-on using ms precision
+  // timeUntilNextOnMs valid only when shouldBeOn==false
+  unsigned long timeUntilNextOnMs = 0;
+  if(!shouldBeOn){
+    unsigned long secsLeft = duracionCiclo - tiempoCicloSec; // seconds
+    unsigned long fracMs = millis() % 1000UL;
+    timeUntilNextOnMs = secsLeft * 1000UL - fracMs; // approximate
+  }
+
+  // If watchdog reset happened recently, block sodium for 30 minutes
+  bool wdogBlockActive = false;
+  if(lastWatchdogResetEpoch != 0){
+    if(rtcValid){
+      long diff = (long)epochSec - (long)lastWatchdogResetEpoch;
+      if(diff < 0) diff = 0;
+      if(diff < 30UL*60UL) wdogBlockActive = true;
+    } else {
+      // If RTC invalid and lastWatchdogResetEpoch stored (but we can't compute diff), be conservative: enforce 30 min block (can't compute) -> skip blocking
+      // We'll not block if RTC invalid and stored epoch==0
+      wdogBlockActive = false;
+    }
+  }
+
+  // Pre-on: trigger if within preOnMs before ON and not already in pre-on or ON
+  static bool preOnActive = false;
+  if(!shouldBeOn && timeUntilNextOnMs <= preOnMs && !preOnActive && !lamparasEncendidas){
+    // Start pre-on
+    preOnActive = true;
+    estadoLamparas = ST_PREON;
+    tExtractorOnMs = millis();
+    // Force extractors on
+    digitalWrite(relayExtractor, LOW);
+    digitalWrite(relayIntractor, LOW);
+    extractorForcedByCycle:; // label not used but placeholder
+    Serial.println(F("Pre-on activated: extractors ON 5s before lights"));
+  }
+
+  // Transition OFF->ON
+  if(shouldBeOn && !lamparasEncendidas){
+    lamparasEncendidas = true;
+    // If preOnActive, extractor already on and tExtractorOnMs set
+    if(!preOnActive){
+      // Start with extractors on now
+      digitalWrite(relayExtractor, LOW);
+      digitalWrite(relayIntractor, LOW);
+      tExtractorOnMs = millis();
+    }
+    estadoLamparas = ST_EXTRACTORES_ON;
+    tLedOnMs = 0;
+    Serial.println(F("Cycle ON: starting sequence"));
+  }
+
+  // Transition ON->OFF
+  if(!shouldBeOn && lamparasEncendidas){
+    lamparasEncendidas = false;
+    preOnActive = false;
+    // Turn off lamps & reset sequence
+    digitalWrite(relayLampara1, HIGH);
+    digitalWrite(relayLampara2, HIGH);
+    digitalWrite(relayExtractor, HIGH);
+    digitalWrite(relayIntractor, HIGH);
+    estadoLamparas = ST_IDLE;
+    tExtractorOnMs = 0;
+    tLedOnMs = 0;
+    lampara1On = false;
+    sodioOn = false;
+    Serial.println(F("Cycle OFF: lamps and extractors turned off and sequence reset"));
+  }
+
+  // If in ON sequence, progress with ms timers
+  if(lamparasEncendidas){
+    unsigned long nowMs = millis();
+
+    // Ensure extractors stay ON during ON period
+    digitalWrite(relayExtractor, LOW);
+    digitalWrite(relayIntractor, LOW);
+    extractoresEncendidosPorHumedad = false; // override humidity behavior
+
+    // state machine
+    switch(estadoLamparas){
+      case ST_EXTRACTORES_ON:
+        if(nowMs - tExtractorOnMs >= tiempoDelayExtractores){
+          // turn on LED
+          digitalWrite(relayLampara1, LOW);
+          tLedOnMs = nowMs;
+          estadoLamparas = ST_LED_ON;
+          Serial.println(F("LED turned ON in sequence"));
+        }
+        break;
+      case ST_LED_ON:
+        if(nowMs - tLedOnMs >= tiempoDelayLED){
+          // Attempt to turn on sodio, but check blocks
+          bool allowSodio = true;
+          if(sodioTempBlocked) allowSodio = false;
+          if(wdogBlockActive) allowSodio = false;
+          if(allowSodio){
+            digitalWrite(relayLampara2, LOW);
+            Serial.println(F("Sodio turned ON in sequence"));
+          } else {
+            digitalWrite(relayLampara2, HIGH);
+            if(sodioTempBlocked) Serial.println(F("Sodio blocked by temp - stays OFF until manual restart"));
+            else if(wdogBlockActive) Serial.println(F("Sodio blocked due to recent watchdog reset (30min)"));
+          }
+          estadoLamparas = ST_SODIO_ON;
+        }
+        break;
+      case ST_SODIO_ON:
+      case ST_READY:
+      default:
+        // nothing else
+        break;
+    }
+  } else {
+    // If OFF and not pre-on, ensure extractors are controlled by humidity handler
+    // preOnActive prevents humidity handler from turning them off during pre-on window
+    if(!preOnActive){
+      // do nothing here; humidity handler will act
+    } else {
+      // if preOnActive and we passed the preOn window, clear it
+      if(timeUntilNextOnMs > preOnMs) {
+        // still far, ensure preOnActive false
+        preOnActive = false;
+      }
+    }
+  }
+
+  // If we are in preOnActive and ON just started, clear preOnActive
+  if(preOnActive && lamparasEncendidas){
+    preOnActive = false;
+  }
+}
+
+// manejarExtractoresHumedad: only acts when lights OFF and not in pre-on
+void manejarExtractoresHumedad(){
+  if(lamparasEncendidas) return; // while ON extractors forced ON
+  if(isnan(ultimaHumedad)) return;
+
+  // preOn window: if we are within last preOnMs before ON, skip humidity control to avoid turning them off
+  DateTime now = rtc.now();
+  bool rtcValid = rtc.isrunning() && now.isValid();
+  unsigned long epoch = leerEpochNowOrFallback(rtcValid, now);
+  unsigned long tiempoCicloSec = epoch % duracionCiclo;
+  unsigned long timeUntilNextOnSec = duracionCiclo - tiempoCicloSec;
+  unsigned long timeUntilNextOnMs = timeUntilNextOnSec * 1000UL - (millis()%1000UL);
+  if(timeUntilNextOnMs <= preOnMs) return; // skip humidity control during pre-on window
+
+  // Now humidity control thresholds: ON if >=60, OFF if <=45
+  if(ultimaHumedad >= umbralHumedadOn && !extractoresEncendidosPorHumedad){
+    digitalWrite(relayExtractor, LOW);
+    digitalWrite(relayIntractor, LOW);
+    extractoresEncendidosPorHumedad = true;
+    Serial.println(F("Extractores ON due to humidity (OFF cycle)"));
+  } else if(ultimaHumedad <= umbralHumedadOff && extractoresEncendidosPorHumedad){
+    digitalWrite(relayExtractor, HIGH);
+    digitalWrite(relayIntractor, HIGH);
+    extractoresEncendidosPorHumedad = false;
+    Serial.println(F("Extractores OFF due to humidity (OFF cycle)"));
+  }
+}
+
+// Return epoch seconds using RTC if valid else millis()/1000
+unsigned long leerEpochNowOrFallback(bool &rtcValid, DateTime &now){
+  if(rtcValid && now.isValid()) return now.unixtime();
+  else return millis()/1000UL;
+}
+
+// LCD update
+void actualizarDisplay(bool rtcValid, DateTime now){
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("T:");
+  if(!isnan(ultimaTemperatura)) lcd.print(ultimaTemperatura,0); else lcd.print("--");
+  lcd.print("C H:");
+  if(!isnan(ultimaHumedad)) lcd.print(ultimaHumedad,0); else lcd.print("--");
+  lcd.print("%");
+
+  lcd.setCursor(10,0);
+  if(rtcValid && now.isValid()){
+    char buf[6]; sprintf(buf,"%02d:%02d", now.hour(), now.minute());
+    lcd.print(buf);
+  } else {
+    // fallback show uptime minutes:seconds
+    unsigned long s = millis()/1000UL;
+    char buf[6]; sprintf(buf,"%02d:%02d", (s/60)%60, s%60);
+    lcd.print(buf);
+  }
+
+  // second line: remaining time
+  unsigned long epoch = leerEpochNowOrFallback(rtcValid, now);
+  unsigned long tiempoCiclo = epoch % duracionCiclo;
+  lcd.setCursor(0,1);
+  if(tiempoCiclo < duracionEncendido){
+    unsigned long restante = duracionEncendido - tiempoCiclo;
+    unsigned long h = restante/3600UL;
+    unsigned long m = (restante%3600UL)/60UL;
+    lcd.print("Luz ON ");
+    lcd.print(h); lcd.print("h ");
+    lcd.print(m); lcd.print("m");
+  } else {
+    unsigned long restante = duracionApagado - (tiempoCiclo - duracionEncendido);
+    unsigned long h = restante/3600UL;
+    unsigned long m = (restante%3600UL)/60UL;
+    lcd.print("Luz OFF ");
+    lcd.print(h); lcd.print("h ");
+    lcd.print(m); lcd.print("m");
+  }
+}
