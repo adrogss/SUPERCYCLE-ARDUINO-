@@ -1,0 +1,310 @@
+#include <Wire.h>
+#include <DHT.h>
+#include <RTClib.h>
+#include <LiquidCrystal_I2C.h>
+#include <avr/wdt.h>
+#include <avr/io.h>
+#include <EEPROM.h>
+
+// PINES
+const int relayExtractor = 2;
+const int relayIntractor = 3; 
+const int relayCalefactor = 4;
+const int relayHumificador = 5;
+const int relayLampara1 = 7; // LED
+const int relayLampara2 = 8; // LED adicional
+const int relayBocina = 6;
+
+const int pinMQ2 = A0;
+const int pinReset = 10; // Botón reset alarma
+
+// DHT
+#define DHTPIN 9
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// Constantes para DHT
+const float DHT_TOLERANCIA_TEMP = 0.5; // ±0.5°C
+const float DHT_TOLERANCIA_HUM = 1.0;  // ±1.0%
+
+// RTC
+RTC_DS1307 rtc;
+
+// Estados de lámparas
+bool lampara1On = false;
+bool lampara2On = false; // LED adicional
+
+// Parámetros de temperatura y humedad
+const float temperaturaMin = 18.0;
+const float temperaturaApagarCalefactor = 21.0;
+const float temperaturaExtractorOn = 24.0;
+const float temperaturaExtractorOff = 19.0;
+
+const float humedadMin = 40.0;
+const float humedadOff = 45.0;
+
+// Control de tiempo del calefactor
+const unsigned long TIEMPO_MAX_CALEFACTOR = 45UL * 60UL * 1000UL; // 45 minutos en ms
+const unsigned long TIEMPO_DESCANSO_CALEFACTOR = 15UL * 60UL * 1000UL; // 15 minutos en ms
+unsigned long tiempoInicioCalefactor = 0;
+unsigned long tiempoInicioDescanso = 0;
+bool calefactorEnDescanso = false;
+
+// Extractores por humedad cuando luces OFF: ON >=60, OFF <=50
+const float umbralHumedadOn = 60.0;
+const float umbralHumedadOff = 50.0;
+bool extractoresEncendidosPorHumedad = false;
+
+// Ciclo 27h -> usamos segundos para modulo
+const unsigned long duracionCiclo = 27UL * 3600UL; // s
+const unsigned long duracionEncendido = 13UL * 3600UL; // s
+const unsigned long duracionApagado = 14UL * 3600UL; // s
+
+// Secuencia tiempos (ms)
+const unsigned long preOnMs = 5000UL;       // 5s pre-on
+const unsigned long tiempoDelayExtractores = 5000UL; // 5s desde extractores a LED
+const unsigned long tiempoDelayLED = 10000UL;       // 10s desde LED 1 a LED 2
+
+// LCD
+LiquidCrystal_I2C lcd(0x3F,16,2);
+
+// DHT timing
+unsigned long lastDHTreadMs = 0;
+const unsigned long intervaloDHT = 2000UL;
+float ultimaTemperatura = NAN;
+float ultimaHumedad = NAN;
+int repetidasDHT = 0;
+
+// Secuencia state
+enum EstadoLamparas { ST_IDLE, ST_PREON, ST_EXTRACTORES_ON, ST_LED_ON, ST_READY };
+EstadoLamparas estadoLamparas = ST_IDLE;
+unsigned long tExtractorOnMs = 0;
+unsigned long tLedOnMs = 0;
+bool lamparasEncendidas = false;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println(F("SUPERCYCLE - Iniciando..."));
+  
+  dht.begin();
+  Wire.begin();
+  
+  if (!rtc.begin()) {
+    Serial.println(F("No se pudo encontrar RTC"));
+  }
+  
+  if (!rtc.isrunning()) {
+    Serial.println(F("RTC no está corriendo!"));
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+  
+  lcd.init();
+  lcd.backlight();
+  lcd.print(F("Iniciando..."));
+  
+  pinMode(relayExtractor, OUTPUT);
+  pinMode(relayIntractor, OUTPUT);
+  pinMode(relayCalefactor, OUTPUT);
+  pinMode(relayHumificador, OUTPUT);
+  pinMode(relayLampara1, OUTPUT);
+  pinMode(relayLampara2, OUTPUT);
+  pinMode(relayBocina, OUTPUT);
+  pinMode(pinReset, INPUT_PULLUP);
+
+  // Apagar relays (HIGH = OFF)
+  digitalWrite(relayExtractor, HIGH);
+  digitalWrite(relayIntractor, HIGH);
+  digitalWrite(relayCalefactor, HIGH);
+  digitalWrite(relayHumificador, HIGH);
+  digitalWrite(relayLampara1, HIGH);
+  digitalWrite(relayLampara2, HIGH);
+  digitalWrite(relayBocina, HIGH);
+
+  Serial.println(F("Sistema iniciado - WDT: 8s"));
+  wdt_enable(WDTO_8S);
+}
+
+void loop() {
+  DateTime now = rtc.now();
+  bool rtcValid = rtc.isrunning() && now.isValid();
+
+  gestionarLecturaDHT();
+  controlarCalefactor();
+  controlarHumidificador();
+  manejarAlarmasYReset();
+
+  controlCentralExtractoresYLamparas(rtcValid, now);
+  manejarExtractoresHumedadOTemperatura();
+
+  // LCD update cada 1s
+  static unsigned long lastLCD = 0;
+  if(millis() - lastLCD >= 1000UL) {
+    actualizarDisplay(rtcValid, now);
+    lastLCD = millis();
+  }
+
+  wdt_reset();
+}
+
+void gestionarLecturaDHT() {
+  unsigned long nowMs = millis();
+
+  if (nowMs - lastDHTreadMs < intervaloDHT) {
+    return;
+  }
+
+  lastDHTreadMs = nowMs;
+
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+
+  // Validar lecturas
+  if (isnan(temp) || isnan(hum)) {
+    repetidasDHT++;
+    Serial.println(F("Error leyendo DHT22"));
+
+    if (repetidasDHT > 5) {
+      Serial.println(F("DHT22 no responde - reiniciando sistema..."));
+      wdt_enable(WDTO_15MS); // Forzar reinicio rápido
+      while (1);
+    }
+    return;
+  }
+
+  repetidasDHT = 0;
+
+  if (!isnan(ultimaTemperatura)) {
+    if (abs(temp - ultimaTemperatura) < DHT_TOLERANCIA_TEMP) {
+      temp = ultimaTemperatura;
+    }
+  }
+  if (!isnan(ultimaHumedad)) {
+    if (abs(hum - ultimaHumedad) < DHT_TOLERANCIA_HUM) {
+      hum = ultimaHumedad;
+    }
+  }
+
+  ultimaTemperatura = temp;
+  ultimaHumedad = hum;
+
+  Serial.print(F("T: "));
+  Serial.print(temp, 1);
+  Serial.print(F("°C  H: "));
+  Serial.print(hum, 1);
+  Serial.println(F("%"));
+}
+
+void controlarCalefactor() {
+  if (lamparasEncendidas) {
+    digitalWrite(relayCalefactor, HIGH); // OFF cuando hay luz
+    return;
+  }
+
+  if (isnan(ultimaTemperatura)) return;
+
+  unsigned long tiempoActual = millis();
+
+  if (calefactorEnDescanso) {
+    if (tiempoActual - tiempoInicioDescanso >= TIEMPO_DESCANSO_CALEFACTOR) {
+      calefactorEnDescanso = false;
+    } else {
+      digitalWrite(relayCalefactor, HIGH);
+      return;
+    }
+  }
+
+  if (ultimaTemperatura < temperaturaMin) {
+    if (digitalRead(relayCalefactor) == HIGH) { // Si está apagado
+      tiempoInicioCalefactor = tiempoActual;
+      digitalWrite(relayCalefactor, LOW);
+    } else if (tiempoActual - tiempoInicioCalefactor >= TIEMPO_MAX_CALEFACTOR) {
+      digitalWrite(relayCalefactor, HIGH);
+      calefactorEnDescanso = true;
+      tiempoInicioDescanso = tiempoActual;
+    }
+  } else if (ultimaTemperatura >= temperaturaApagarCalefactor) {
+    digitalWrite(relayCalefactor, HIGH);
+  }
+}
+
+void manejarExtractoresHumedadOTemperatura() {
+  if (isnan(ultimaTemperatura) || isnan(ultimaHumedad)) return;
+
+  if (lamparasEncendidas) {
+    // Control por temperatura
+    if (ultimaTemperatura >= temperaturaExtractorOn) {
+      digitalWrite(relayExtractor, LOW);
+      digitalWrite(relayIntractor, LOW);
+    } else if (ultimaTemperatura <= temperaturaExtractorOff) {
+      digitalWrite(relayExtractor, HIGH);
+      digitalWrite(relayIntractor, HIGH);
+    }
+  } else {
+    // Control por humedad
+    if (!extractoresEncendidosPorHumedad && ultimaHumedad >= umbralHumedadOn) {
+      digitalWrite(relayExtractor, LOW);
+      digitalWrite(relayIntractor, LOW);
+      extractoresEncendidosPorHumedad = true;
+    } else if (extractoresEncendidosPorHumedad && ultimaHumedad <= umbralHumedadOff) {
+      digitalWrite(relayExtractor, HIGH);
+      digitalWrite(relayIntractor, HIGH);
+      extractoresEncendidosPorHumedad = false;
+    }
+  }
+}
+
+void controlCentralExtractoresYLamparas(bool rtcValid, DateTime now) {
+  unsigned long epoch = millis() / 1000UL; 
+  unsigned long tiempoCiclo = epoch % duracionCiclo;
+  bool shouldBeOn = (tiempoCiclo < duracionEncendido);
+
+  if(shouldBeOn && !lamparasEncendidas) {
+    lamparasEncendidas = true;
+    tExtractorOnMs = millis();
+    estadoLamparas = ST_EXTRACTORES_ON;
+    tLedOnMs = 0;
+    Serial.println(F("Inicio ciclo ON"));
+  }
+
+  if(!shouldBeOn && lamparasEncendidas) {
+    lamparasEncendidas = false;
+    digitalWrite(relayLampara1, HIGH);
+    digitalWrite(relayLampara2, HIGH);
+    digitalWrite(relayExtractor, HIGH);
+    digitalWrite(relayIntractor, HIGH);
+    estadoLamparas = ST_IDLE;
+    tExtractorOnMs = 0;
+    tLedOnMs = 0;
+    lampara1On = false;
+    lampara2On = false;
+    Serial.println(F("Inicio ciclo OFF"));
+  }
+
+  if(lamparasEncendidas) {
+    unsigned long nowMs = millis();
+
+    switch(estadoLamparas) {
+      case ST_EXTRACTORES_ON:
+        if(nowMs - tExtractorOnMs >= tiempoDelayExtractores) {
+          digitalWrite(relayLampara1, LOW);
+          lampara1On = true;
+          tLedOnMs = nowMs;
+          estadoLamparas = ST_LED_ON;
+          Serial.println(F("LED 1 ON"));
+        }
+        break;
+
+      case ST_LED_ON:
+        if(nowMs - tLedOnMs >= tiempoDelayLED) {
+          digitalWrite(relayLampara2, LOW);
+          lampara2On = true;
+          Serial.println(F("LED 2 ON"));
+          estadoLamparas = ST_READY;
+        }
+        break;
+
+      default:
+        break;
+    }
+  }
+}
